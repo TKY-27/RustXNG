@@ -12,7 +12,6 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use super::AppState;
-use crate::engine::EngineRequest;
 
 /// Maximum size of a proxied image (8 MiB, like upstream's `image_proxy_max_size`).
 pub const MAX_SIZE: usize = 8 * 1024 * 1024;
@@ -83,34 +82,10 @@ pub fn is_public_url(url: &str) -> bool {
     let Ok(parsed) = url::Url::parse(url) else {
         return false;
     };
-    if !matches!(parsed.scheme(), "http" | "https") {
-        return false;
-    }
-    let Some(host) = parsed.host_str() else {
-        return false;
-    };
-    let host = host.trim_matches(['[', ']']).to_lowercase();
-    if host == "localhost" || host.ends_with(".local") || host == "::1" || host == "0.0.0.0" {
-        return false;
-    }
-    match host.parse::<std::net::IpAddr>() {
-        Ok(address) => is_public_address(address),
-        Err(_) => true,
-    }
-}
-
-fn is_public_address(address: std::net::IpAddr) -> bool {
-    match address {
-        std::net::IpAddr::V4(address) => {
-            !(address.is_private()
-                || address.is_loopback()
-                || address.is_link_local()
-                || address.is_broadcast()
-                || address.is_documentation()
-                || address.is_unspecified())
-        }
-        std::net::IpAddr::V6(address) => !(address.is_loopback() || address.is_unspecified()),
-    }
+    crate::mcp::page::is_fetchable(&parsed)
+        && parsed
+            .host_str()
+            .is_some_and(|host| !host.trim_end_matches('.').ends_with(".local"))
 }
 
 /// `GET /image_proxy`.
@@ -137,21 +112,17 @@ pub async fn handler(
         return (StatusCode::FORBIDDEN, "the URL is not a public http(s) URL").into_response();
     }
 
-    let mut request = EngineRequest::get(params.url.clone());
-    if let Some(referer) = headers
+    let referer = headers
         .get(header::REFERER)
-        .and_then(|value| value.to_str().ok())
-    {
-        request = request.header("Referer", referer);
-    }
-    let response = match state
+        .and_then(|value| value.to_str().ok());
+    let (content_type, body) = match state
         .searcher
-        .network
-        .fetch(
-            request,
+        .page_reader
+        .image(
+            &params.url,
+            MAX_SIZE,
             std::time::Duration::from_secs_f64(settings.outgoing.request_timeout.max(1.0)),
-            None,
-            None,
+            referer,
         )
         .await
     {
@@ -160,22 +131,12 @@ pub async fn handler(
             return (StatusCode::BAD_GATEWAY, format!("upstream error: {error}")).into_response();
         }
     };
-    if response.body.len() > MAX_SIZE {
-        return (StatusCode::BAD_GATEWAY, "image is too large").into_response();
-    }
-    let content_type = response
-        .header("content-type")
-        .unwrap_or("application/octet-stream")
-        .to_string();
-    if !content_type.starts_with("image/") {
-        return (StatusCode::BAD_GATEWAY, "upstream did not return an image").into_response();
-    }
     (
         [
             (header::CONTENT_TYPE, content_type),
             (header::CACHE_CONTROL, "max-age=86400".to_string()),
         ],
-        response.body,
+        body,
     )
         .into_response()
 }

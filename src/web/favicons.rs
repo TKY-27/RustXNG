@@ -23,7 +23,6 @@ use serde::Deserialize;
 
 use super::AppState;
 use super::image_proxy::{is_public_url, is_valid, signature};
-use crate::engine::EngineRequest;
 
 /// The path of the favicon proxy (upstream's 'favicon_proxy' route).
 pub const PROXY_PATH: &str = "/favicon_proxy";
@@ -127,28 +126,19 @@ pub async fn handler(
     (StatusCode::NOT_FOUND, "no favicon found").into_response()
 }
 
-/// Fetch one candidate; redirects are followed by the network client.  'None'
-/// when the answer is not a (small enough) image.
+/// Fetch a bounded candidate through checked public destinations.
 async fn fetch_favicon(state: &AppState, url: &str) -> Option<(String, Vec<u8>)> {
     let timeout = Duration::from_secs_f64(state.settings().outgoing.request_timeout.max(1.0));
-    let request = EngineRequest::get(url.to_string()).header("Accept", "image/*");
-    let response = state
+    let (content_type, body) = state
         .searcher
-        .network
-        .fetch(request, timeout, None, None)
+        .page_reader
+        .image(url, MAX_SIZE, timeout, None)
         .await
         .ok()?;
-    if response.body.is_empty() || response.body.len() > MAX_SIZE {
+    if body.is_empty() {
         return None;
     }
-    let content_type = response
-        .header("content-type")
-        .unwrap_or_default()
-        .to_string();
-    if !content_type.starts_with("image/") {
-        return None;
-    }
-    Some((content_type, response.body))
+    Some((content_type, body))
 }
 
 #[cfg(test)]

@@ -207,6 +207,56 @@ impl PageReader {
         Ok(self.read(url, max_chars).await?.text)
     }
 
+    /// Fetch bounded image bytes through checked public destinations.
+    pub(crate) async fn image(
+        &self,
+        url: &str,
+        max_bytes: usize,
+        timeout: Duration,
+        referer: Option<&str>,
+    ) -> Result<(String, Vec<u8>), String> {
+        if self.proxy_blocked {
+            return Err("image reads are unavailable with configured proxies".into());
+        }
+        let parsed = reqwest::Url::parse(url).map_err(|_| "not a valid URL".to_string())?;
+        if !is_fetchable(&parsed) {
+            return Err("only public http(s) images can be read".into());
+        }
+        let fetch = async {
+            let _permit = self
+                .permits
+                .acquire()
+                .await
+                .map_err(|error| error.to_string())?;
+            let mut request = self
+                .client
+                .get(parsed)
+                .timeout(timeout)
+                .header("Accept", "image/*");
+            if let Some(referer) = referer {
+                request = request.header(reqwest::header::REFERER, referer);
+            }
+            let mut response = request.send().await.map_err(|error| error.to_string())?;
+            if !response.status().is_success() {
+                return Err(format!("the image answered {}", response.status()));
+            }
+            let content_type = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            if !content_type.to_ascii_lowercase().starts_with("image/") {
+                return Err("upstream did not return an image".into());
+            }
+            let body = read_body(&mut response, max_bytes).await?;
+            Ok((content_type, body))
+        };
+        tokio::time::timeout(timeout, fetch)
+            .await
+            .map_err(|_| "the image took too long to load".to_string())?
+    }
+
     /// Fetch and extract a page. `source_truncated` is set when readable text
     /// exceeded `max_chars`; callers can keep it distinct from output slicing.
     pub async fn read(&self, url: &str, max_chars: usize) -> Result<PageContent, String> {
@@ -269,19 +319,7 @@ impl PageReader {
         if !(content_type.starts_with("text/") || content_type.contains("xhtml")) {
             return Err(format!("not a text page ({content_type})"));
         }
-        // Read at most MAX_BODY_BYTES decoded bytes, whatever Content-Length says.
-        let mut body = Vec::new();
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|error| format!("the page could not be read: {error}"))?
-        {
-            let room = MAX_BODY_BYTES - body.len();
-            if chunk.len() > room {
-                return Err("page exceeds the 4 MiB decoded body limit".into());
-            }
-            body.extend_from_slice(&chunk);
-        }
+        let body = read_body(&mut response, MAX_BODY_BYTES).await?;
         Ok(String::from_utf8_lossy(&body).into_owned())
     }
 
@@ -318,6 +356,19 @@ impl PageReader {
     }
 }
 
+async fn read_body(response: &mut reqwest::Response, max_bytes: usize) -> Result<Vec<u8>, String> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|error| error.to_string())? {
+        if chunk.len() > max_bytes - body.len() {
+            return Err(format!(
+                "response exceeds the {max_bytes} byte decoded body limit"
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 /// Environment proxies are deliberately rejected: using one would delegate
 /// DNS resolution and destination selection to the proxy, bypassing our pin.
 fn environment_proxy_configured() -> bool {
@@ -340,6 +391,188 @@ fn environment_proxy_configured() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn media_handlers_validate_redirects_and_preserve_image_responses() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode, header};
+        use axum::response::Redirect;
+        use axum::routing::get;
+        use http_body_util::BodyExt;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tower::ServiceExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let port = address.port();
+        let private_requests = Arc::new(AtomicUsize::new(0));
+        let counter = private_requests.clone();
+        let upstream = axum::Router::new()
+            .route(
+                "/image",
+                get(|| async { ([(header::CONTENT_TYPE, "image/png")], "image") }),
+            )
+            .route("/redirect", get(|| async { Redirect::temporary("/image") }))
+            .route(
+                "/private-redirect",
+                get(move || async move {
+                    Redirect::temporary(&format!("http://127.0.0.1:{port}/private"))
+                }),
+            )
+            .route(
+                "/named-redirect",
+                get(move || async move {
+                    Redirect::temporary(&format!("http://localhost.:{port}/private"))
+                }),
+            )
+            .route(
+                "/private",
+                get(move || {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    async { ([(header::CONTENT_TYPE, "image/png")], "private") }
+                }),
+            )
+            .route("/favicon.ico", get(|| async { StatusCode::NOT_FOUND }))
+            .route(
+                "/favicon.png",
+                get(|| async { ([(header::CONTENT_TYPE, "image/png")], "favicon") }),
+            );
+        tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+        let mut settings = crate::settings::Settings::defaults();
+        settings.engines.clear();
+        settings.server.image_proxy = true;
+        settings.server.secret_key = "media-test".into();
+        let mut searcher = crate::aggregator::Searcher::new(settings).unwrap();
+        searcher.page_reader = PageReader::new(
+            &searcher.settings.outgoing,
+            &[("example.com".into(), address)],
+        )
+        .unwrap();
+        // This fixture uses pinned loopback, never environment proxies.
+        searcher.page_reader.proxy_blocked = false;
+        let app = crate::web::router(crate::web::AppState::new(searcher));
+        let origin = format!("http://example.com:{port}");
+        for (path, expected) in [
+            ("/image", StatusCode::OK),
+            ("/redirect", StatusCode::OK),
+            ("/private-redirect", StatusCode::BAD_GATEWAY),
+            ("/named-redirect", StatusCode::BAD_GATEWAY),
+        ] {
+            let uri =
+                crate::web::image_proxy::proxied_url("", "media-test", &format!("{origin}{path}"));
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "{path}");
+            if expected == StatusCode::OK {
+                assert_eq!(response.headers()[header::CONTENT_TYPE], "image/png");
+                assert_eq!(response.headers()[header::CACHE_CONTROL], "max-age=86400");
+                assert_eq!(
+                    response.into_body().collect().await.unwrap().to_bytes(),
+                    "image"
+                );
+            }
+        }
+        assert_eq!(private_requests.load(Ordering::SeqCst), 0);
+        let uri = crate::web::favicons::favicon_url("", "media-test", &origin);
+        let response = app
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "image/png");
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "max-age=604800");
+        assert_eq!(
+            response.into_body().collect().await.unwrap().to_bytes(),
+            "favicon"
+        );
+    }
+
+    #[tokio::test]
+    async fn image_bodies_are_checked_before_buffering_or_waiting_for_eof() {
+        use axum::body::Body;
+        use axum::http::header;
+        use axum::routing::get;
+        use futures::StreamExt;
+        use std::convert::Infallible;
+
+        let upstream =
+            axum::Router::new()
+                .route(
+                    "/large",
+                    get(|| async {
+                        let chunks =
+                            futures::stream::once(async { Ok::<_, Infallible>(vec![b'x'; 33]) })
+                                .chain(futures::stream::pending());
+                        (
+                            [(header::CONTENT_TYPE, "image/png")],
+                            Body::from_stream(chunks),
+                        )
+                    }),
+                )
+                .route(
+                    "/not-image",
+                    get(|| async {
+                        (
+                            [(header::CONTENT_TYPE, "text/html")],
+                            Body::from_stream(futures::stream::pending::<
+                                Result<Vec<u8>, Infallible>,
+                            >()),
+                        )
+                    }),
+                )
+                .route(
+                    "/compressed",
+                    get(|| async {
+                        // 33 decoded bytes, compressed below the 32-byte limit.
+                        (
+                            [
+                                (header::CONTENT_TYPE, "image/png"),
+                                (header::CONTENT_ENCODING, "gzip"),
+                            ],
+                            vec![
+                                31, 139, 8, 0, 0, 0, 0, 0, 2, 3, 171, 168, 32, 0, 0, 172, 211, 191,
+                                111, 33, 0, 0, 0,
+                            ],
+                        )
+                    }),
+                )
+                .route(
+                    "/exact",
+                    get(|| async { ([(header::CONTENT_TYPE, "image/png")], vec![b'x'; 32]) }),
+                );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+        let mut reader = PageReader::new(
+            &crate::settings::Outgoing::default(),
+            &[("example.com".into(), address)],
+        )
+        .unwrap();
+        reader.proxy_blocked = false;
+        for (path, expected) in [
+            ("/large", "decoded body limit"),
+            ("/compressed", "decoded body limit"),
+            ("/not-image", "did not return an image"),
+        ] {
+            let url = format!("http://example.com:{}{path}", address.port());
+            let result = tokio::time::timeout(
+                Duration::from_secs(2),
+                reader.image(&url, 32, Duration::from_secs(10), None),
+            )
+            .await
+            .expect("must reject before awaiting the body tail");
+            assert!(result.unwrap_err().contains(expected), "{path}");
+        }
+        let url = format!("http://example.com:{}/exact", address.port());
+        let (_, body) = reader
+            .image(&url, 32, Duration::from_secs(2), None)
+            .await
+            .unwrap();
+        assert_eq!(body, [b'x'; 32]);
+    }
 
     #[test]
     fn http_page_cache_expires_while_session_paging_stays_stable() {
@@ -439,6 +672,11 @@ mod tests {
             .insert("all".into(), "http://127.0.0.1:8080".into());
         let reader = PageReader::new(&outgoing, &[]).unwrap();
         let error = reader.text("https://example.com/", 100).await.unwrap_err();
+        assert!(error.contains("configured proxies"));
+        let error = reader
+            .image("https://example.com/", 100, Duration::from_secs(1), None)
+            .await
+            .unwrap_err();
         assert!(error.contains("configured proxies"));
     }
 
