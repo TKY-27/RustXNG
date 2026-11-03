@@ -1,5 +1,5 @@
 # Build stage: templates and static files are embedded at compile time.
-FROM rust:1.99.1-slim AS build
+FROM rust:1.99.1-slim-bookworm AS build
 WORKDIR /app
 COPY Cargo.toml Cargo.lock build.rs ./
 COPY settings.toml ./
