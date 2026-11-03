@@ -38,6 +38,7 @@ pub(super) async fn render(
     client: &reqwest::Client,
     command: &[String],
     url: reqwest::Url,
+    media_type: &'static str,
     html: String,
 ) -> Result<String, String> {
     let client = client.clone();
@@ -49,7 +50,7 @@ pub(super) async fn render(
             permit = RENDERERS.acquire() => permit.map_err(|error| error.to_string())?,
             _ = &mut cancelled => return Err("page rendering cancelled".into()),
         };
-        run(&client, &command, url, html, &mut cancelled).await
+        run(&client, &command, url, media_type, html, &mut cancelled).await
     })
     .await
     .map_err(|error| format!("page renderer task failed: {error}"))?;
@@ -61,6 +62,7 @@ async fn run(
     client: &reqwest::Client,
     command: &[String],
     url: reqwest::Url,
+    media_type: &str,
     html: String,
     cancelled: &mut tokio::sync::oneshot::Receiver<()>,
 ) -> Result<String, String> {
@@ -82,7 +84,8 @@ async fn run(
     let rendering = async {
         write_message(
             &mut input,
-            &json!({"url": url.as_str(), "html": html, "max_bytes": MAX_BODY_BYTES}),
+            &json!({"url": url.as_str(), "html": html,
+                "content_type": media_type, "max_bytes": MAX_BODY_BYTES}),
         )
         .await?;
         let mut requests = 0;

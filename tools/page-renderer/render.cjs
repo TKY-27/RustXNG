@@ -8,11 +8,14 @@ async function main() {
   const messages = input[Symbol.asyncIterator]();
   const first = await messages.next();
   if (first.done) throw new Error('renderer input closed');
-  const { url, html, max_bytes: maxBytes } = JSON.parse(first.value);
+  const {
+    url, html, content_type: contentType = 'text/html', max_bytes: maxBytes,
+  } = JSON.parse(first.value);
   if (typeof html !== 'string' || !Number.isInteger(maxBytes) ||
       maxBytes < 1 || maxBytes > 4 * 1024 * 1024 || Buffer.byteLength(html) > maxBytes) {
     throw new Error('invalid renderer input size');
   }
+  if (!['text/html', 'application/xhtml+xml'].includes(contentType)) throw new Error('invalid page content type');
   const initialUrl = new URL(url);
   initialUrl.hash = '';
   if (!['http:', 'https:'].includes(initialUrl.protocol)) throw new Error('invalid page URL');
@@ -76,7 +79,7 @@ async function main() {
         const request = route.request();
         if (initial && request.isNavigationRequest() && request.url() === initialUrl.href) {
           initial = false;
-          await route.fulfill({ status: 200, contentType: 'text/html; charset=utf-8', body: html });
+          await route.fulfill({ status: 200, contentType: `${contentType}; charset=utf-8`, body: html });
           return;
         }
         if (!['GET', 'HEAD'].includes(request.method())) throw new Error('unsupported resource method');

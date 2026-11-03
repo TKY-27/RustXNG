@@ -210,7 +210,7 @@ enum PageBody {
     Text {
         url: reqwest::Url,
         content: String,
-        is_html: bool,
+        html_media_type: Option<&'static str>,
     },
     Pdf(Vec<u8>),
 }
@@ -303,12 +303,19 @@ impl PageReader {
             PageBody::Text {
                 url,
                 mut content,
-                is_html,
+                html_media_type,
             } => {
-                if is_html && !self.renderer_command.is_empty() {
-                    content =
-                        super::render::render(&self.client, &self.renderer_command, url, content)
-                            .await?;
+                if let Some(media_type) = html_media_type
+                    && !self.renderer_command.is_empty()
+                {
+                    content = super::render::render(
+                        &self.client,
+                        &self.renderer_command,
+                        url,
+                        media_type,
+                        content,
+                    )
+                    .await?;
                 }
                 tokio::task::spawn_blocking(move || {
                     let document = scraper::Html::parse_document(&content);
@@ -357,7 +364,11 @@ impl PageReader {
         if !(is_text || is_pdf || media_type == "application/octet-stream") {
             return Err(format!("not a text page ({content_type})"));
         }
-        let is_html = matches!(media_type, "text/html" | "application/xhtml+xml");
+        let html_media_type = match media_type {
+            "text/html" => Some("text/html"),
+            "application/xhtml+xml" => Some("application/xhtml+xml"),
+            _ => None,
+        };
         // Read at most MAX_BODY_BYTES decoded bytes, whatever Content-Length says.
         let mut body = Vec::new();
         while let Some(chunk) = response
@@ -379,7 +390,7 @@ impl PageReader {
             Ok(PageBody::Text {
                 url: response.url().clone(),
                 content: String::from_utf8_lossy(&body).into_owned(),
-                is_html,
+                html_media_type,
             })
         } else {
             Err(format!("not a text page ({content_type})"))

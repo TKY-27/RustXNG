@@ -35,6 +35,13 @@ async fn javascript_pages_keep_guarded_fetches_limits_and_cached_text() {
         .route("/article/body.json", get(move || async move {
             axum::Json(serde_json::json!({"text": body}))
         }))
+        .route("/article.xhtml", get(|| async { (
+            [(header::CONTENT_TYPE, "application/xhtml+xml; charset=utf-8")],
+            r#"<html xmlns="http://www.w3.org/1999/xhtml"><head><title>Fixture</title></head>
+                <body><main>Loading</main><script>
+                if (1 &lt; 2) document.querySelector('main').textContent = '日本語のXHTML本文';
+                </script></body></html>"#,
+        ) }))
         .route("/private", get(move || async move { (
             [(header::CONTENT_TYPE, "text/html")],
             format!("<main>Loading</main><script src='http://{address}/canary'></script>"),
@@ -77,6 +84,14 @@ async fn javascript_pages_keep_guarded_fetches_limits_and_cached_text() {
     assert!(!page.source_truncated);
     assert_eq!(&*reader.read(&url, 20000).await.unwrap().text, text);
     assert_eq!(page_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        &*reader
+            .read(&format!("{origin}/article.xhtml"), 100)
+            .await
+            .unwrap()
+            .text,
+        "日本語のXHTML本文"
+    );
     for (path, expected) in [
         ("private", "only public http(s) rendering resources"),
         ("redirected-resource", "redirected rendering resources"),

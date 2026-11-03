@@ -72,7 +72,9 @@ beyond 8,000 characters, rejected requests, UTF-8 output bounds, and shutdown.
 No external page is requested by the tests.
 
 The helper communicates with RustXNG using JSON lines on standard input/output.
-Its first input is `{url, html, max_bytes}`. It sends resource requests as
+Its first input is `{url, html, content_type, max_bytes}`. `content_type` is
+`text/html` (the default) or `application/xhtml+xml`, preserving the page's parser.
+It sends resource requests as
 `{type: "fetch", id, url, method}` and receives `{id, status, headers, body}`,
 where `body` is base64, or `{id, error}`. Its result is
 `{type: "html", body}` with base64 HTML, or `{type: "error", message}`.
