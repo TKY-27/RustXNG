@@ -17,9 +17,9 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
-serde_yaml = "0.9"
-askama = "0.16"
-scraper = "0.20"
+yaml_serde = "0.10.7"
+askama = { version = "0.16", default-features = false, features = ["derive", "std", "urlencode"] }
+scraper = "0.29"
 url = "2"
 percent-encoding = "2"
 futures = "0.3"
