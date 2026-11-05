@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 const net = require('node:net');
 const readline = require('node:readline');
+const { ResourceMonitor } = require('./resource-monitor.cjs');
 
 async function main() {
   const { firefox } = require('playwright');
@@ -22,6 +23,7 @@ async function main() {
 
   const pending = new Map();
   let browser;
+  let resources;
   let nextId = 0;
   let fail;
   const failure = new Promise((_, reject) => { fail = reject; });
@@ -73,8 +75,10 @@ async function main() {
     });
     const context = await browser.newContext({ serviceWorkers: 'block', acceptDownloads: false });
     await context.routeWebSocket('**/*', socket => socket.close());
+    resources = new ResourceMonitor();
     let initial = true;
     await context.route('**/*', async route => {
+      const finished = resources.start();
       try {
         const request = route.request();
         if (initial && request.isNavigationRequest() && request.url() === initialUrl.href) {
@@ -97,21 +101,46 @@ async function main() {
       } catch (error) {
         fail(error);
         await route.abort().catch(() => {});
+      } finally {
+        finished();
       }
     });
     const page = await context.newPage();
+    page.on('worker', worker => {
+      const finished = resources.start();
+      let closed = false;
+      worker.once('close', () => { closed = true; finished(); });
+      // Let startup yield to a normal worker task before considering it idle.
+      void worker.evaluate(() => new Promise(resolve => {
+        const channel = new MessageChannel();
+        channel.port1.onmessage = () => {
+          channel.port1.close();
+          channel.port2.close();
+          resolve();
+        };
+        channel.port2.postMessage(null);
+      })).catch(error => {
+        if (!closed) fail(error);
+      }).finally(finished);
+    });
     const rendered = (async () => {
-      await page.goto(url, { waitUntil: 'networkidle', timeout: 10000 });
-      const output = await page.evaluate(limit => {
-        const value = document.documentElement.outerHTML;
-        return typeof value === 'string' && value.length <= limit ? value : null;
-      }, maxBytes);
+      await page.goto(url, { waitUntil: 'load', timeout: 10000 });
+      let version;
+      let output;
+      do {
+        version = await resources.wait();
+        output = await page.evaluate(limit => {
+          const value = document.documentElement.outerHTML;
+          return typeof value === 'string' && value.length <= limit ? value : null;
+        }, maxBytes);
+      } while (!resources.unchanged(version));
       if (output === null || Buffer.byteLength(output) > maxBytes) throw new Error('rendered HTML too large');
       return Buffer.from(output).toString('base64');
     })();
-    const body = await Promise.race([rendered, failure]);
+    const body = await Promise.race([rendered, failure, resources.deadline]);
     process.stdout.write(JSON.stringify({ type: 'html', body }) + '\n');
   } finally {
+    resources?.close();
     if (browser) await browser.close();
     await new Promise(resolve => denyProxy.close(resolve));
     input.removeListener('close', stop);

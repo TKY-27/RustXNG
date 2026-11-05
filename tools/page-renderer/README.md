@@ -35,8 +35,11 @@ its own `max_chars`, payload budgets, and pagination.
 ## Supported pages and limits
 
 The helper supports scripts, GET/HEAD requests, and ordinary Web Workers. It
-waits for 500 ms without network activity, up to 10 seconds, before extracting
-the DOM. Content scheduled after that point may not be included. Rendering is
+waits for worker startup and all intercepted resources to finish, followed by
+500 ms without further resource activity, before extracting the DOM. A resource
+that starts during extraction causes the snapshot to be retried. This wait and
+extraction share a 10-second deadline. Workers need not terminate or send a
+message. Content scheduled after the quiet period may not be included. Rendering is
 limited to 15 seconds including browser startup, after the initial page
 download. Process and profile cleanup can take up to 8 additional seconds after
 cancellation or the deadline. A fresh browser is closed after each page, and no
