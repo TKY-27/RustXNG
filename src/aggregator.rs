@@ -42,6 +42,8 @@ pub struct SearchRequest {
     pub exclude_domains: Vec<String>,
     /// Fetch the page text for the top results and return it as raw_content.
     pub include_raw_content: bool,
+    /// Explicit language preference for page text, independent of engine locale.
+    pub accept_language: crate::fetch::AcceptLanguage,
     /// How the selected engines are started.
     pub strategy: crate::settings::SearchStrategy,
     /// Set once the site-scoped second pass already ran, so it cannot recurse.
@@ -68,6 +70,7 @@ impl SearchRequest {
             include_domains: Vec::new(),
             exclude_domains: Vec::new(),
             include_raw_content: false,
+            accept_language: crate::fetch::AcceptLanguage::default(),
             strategy: crate::settings::SearchStrategy::Parallel,
             site_retry_done: false,
             query,
@@ -719,7 +722,8 @@ impl Searcher {
             request.max_results,
         );
         if request.include_raw_content {
-            self.attach_raw_content(&mut results).await;
+            self.attach_raw_content(&mut results, &request.accept_language)
+                .await;
         }
 
         response.number_of_results = container.number_of_results();
@@ -1158,7 +1162,11 @@ impl Searcher {
             .collect()
     }
 
-    async fn attach_raw_content(&self, results: &mut [SearchResult]) {
+    async fn attach_raw_content(
+        &self,
+        results: &mut [SearchResult],
+        language: &crate::fetch::AcceptLanguage,
+    ) {
         let limit = self.settings.search.raw_content_limit.max(1);
         let count = results.len().min(limit);
         if count == 0 {
@@ -1168,7 +1176,7 @@ impl Searcher {
             results
                 .iter()
                 .take(count)
-                .map(|result| self.page_text(&result.url)),
+                .map(|result| self.page_text(&result.url, language)),
         )
         .await;
         for (result, page) in results.iter_mut().take(count).zip(texts) {
@@ -1181,10 +1189,14 @@ impl Searcher {
 
     /// Optional page reads use the same DNS, redirect, body and concurrency
     /// checks as MCP. Unchecked engine-response cache entries are not reused.
-    async fn page_text(&self, url: &str) -> Option<crate::fetch::PageContent> {
+    async fn page_text(
+        &self,
+        url: &str,
+        language: &crate::fetch::AcceptLanguage,
+    ) -> Option<crate::fetch::PageContent> {
         match self
             .page_reader
-            .read(url, self.settings.search.raw_content_chars.max(1))
+            .read_with_language(url, self.settings.search.raw_content_chars.max(1), language)
             .await
         {
             Ok(page) => Some(page),
@@ -1486,7 +1498,9 @@ mod orchestration_tests {
             "http://127.0.0.1:9/private",
             "poisoned result",
         )];
-        searcher.attach_raw_content(&mut results).await;
+        searcher
+            .attach_raw_content(&mut results, &crate::fetch::AcceptLanguage::default())
+            .await;
         assert!(results[0].raw_content.is_none());
         assert!(results[0].raw_content_truncated.is_none());
     }

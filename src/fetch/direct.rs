@@ -24,6 +24,8 @@ use std::time::{Duration, Instant};
 
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 
+use super::AcceptLanguage;
+
 /// Decoded body bytes read from one page at most.
 pub const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
 /// Pages fetched and parsed at the same time at most.
@@ -208,8 +210,13 @@ pub(crate) fn test_public_client(
         .0
 }
 
-/// Extracted pages as (URL, text), oldest first.
-type Pages = VecDeque<(String, usize, std::time::Instant, PageContent)>;
+struct CachedPage {
+    url: String,
+    max_chars: usize,
+    language: AcceptLanguage,
+    saved: Instant,
+    content: PageContent,
+}
 
 enum PageBody {
     Text {
@@ -231,7 +238,7 @@ type RobotsCache = HashMap<String, (Instant, Arc<crate::robots::Robots>)>;
 pub struct PageReader {
     client: reqwest::Client,
     permits: Arc<tokio::sync::Semaphore>,
-    pages: Arc<Mutex<Pages>>,
+    pages: Arc<Mutex<VecDeque<CachedPage>>>,
     proxy_blocked: bool,
     cache_ttl: Option<Duration>,
     /// robots.txt per site (`host:port`), kept for an hour.
@@ -309,10 +316,24 @@ impl PageReader {
     /// Fetch and extract a page. `source_truncated` is set when readable text
     /// exceeded `max_chars`; callers can keep it distinct from output slicing.
     pub async fn read(&self, url: &str, max_chars: usize) -> Result<PageContent, String> {
+        self.read_with_language(url, max_chars, &AcceptLanguage::default())
+            .await
+    }
+
+    /// Read a language variant. The same preference must be used when paging.
+    pub async fn read_with_language(
+        &self,
+        url: &str,
+        max_chars: usize,
+        language: &AcceptLanguage,
+    ) -> Result<PageContent, String> {
+        if self.source.is_some() && language.as_str().is_some() {
+            return Err("accept_language requires the direct page fetch provider".into());
+        }
         if self.source.is_none() && self.proxy_blocked {
             return Err("page reads are unavailable with configured proxies: destination validation requires direct connections".into());
         }
-        if let Some(content) = self.remembered(url, max_chars) {
+        if let Some(content) = self.remembered(url, max_chars, language) {
             return Ok(content);
         }
         let parsed = reqwest::Url::parse(url).map_err(|_| "not a valid URL".to_string())?;
@@ -326,7 +347,7 @@ impl PageReader {
             .map_err(|error| error.to_string())?;
         if let Some(source) = &self.source {
             let content = source.fetch(&parsed, max_chars).await?;
-            self.remember(url, max_chars, content.clone());
+            self.remember(url, max_chars, language, content.clone());
             return Ok(content);
         }
         // An external provider fetches the page itself; robots.txt is checked
@@ -334,7 +355,7 @@ impl PageReader {
         if !self.robots_allow(&parsed).await {
             return Err("the site's robots.txt asks automated tools not to read this page".into());
         }
-        let body = tokio::time::timeout(FETCH_TIMEOUT, self.fetch(parsed))
+        let body = tokio::time::timeout(FETCH_TIMEOUT, self.fetch(parsed, language))
             .await
             .map_err(|_| "the page took too long to load".to_string())??;
         let text = match body {
@@ -352,6 +373,7 @@ impl PageReader {
                         url,
                         media_type,
                         content,
+                        language,
                     )
                     .await?;
                 }
@@ -372,7 +394,7 @@ impl PageReader {
             source_truncated: text.chars().count() > max_chars,
             text,
         };
-        self.remember(url, max_chars, content.clone());
+        self.remember(url, max_chars, language, content.clone());
         Ok(content)
     }
 
@@ -433,14 +455,17 @@ impl PageReader {
         crate::robots::Robots::from_response(status, &String::from_utf8_lossy(&body), "rustxng")
     }
 
-    async fn fetch(&self, url: reqwest::Url) -> Result<PageBody, String> {
-        let mut response = self
-            .client
-            .get(url)
-            .header(
-                "Accept",
-                "text/html,application/xhtml+xml;q=0.9,application/pdf;q=0.9,text/plain;q=0.8",
-            )
+    async fn fetch(
+        &self,
+        url: reqwest::Url,
+        language: &AcceptLanguage,
+    ) -> Result<PageBody, String> {
+        let request = self.client.get(url).header(
+            "Accept",
+            "text/html,application/xhtml+xml;q=0.9,application/pdf;q=0.9,text/plain;q=0.8",
+        );
+        let mut response = language
+            .apply(request)
             .send()
             .await
             .map_err(|error| format!("the page could not be fetched: {error}"))?;
@@ -492,33 +517,48 @@ impl PageReader {
         }
     }
 
-    fn remembered(&self, url: &str, max_chars: usize) -> Option<PageContent> {
+    fn remembered(
+        &self,
+        url: &str,
+        max_chars: usize,
+        language: &AcceptLanguage,
+    ) -> Option<PageContent> {
         let pages = self
             .pages
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         pages
             .iter()
-            .find(|(known, limit, saved, _)| {
-                known == url
-                    && *limit == max_chars
-                    && self.cache_ttl.is_none_or(|ttl| saved.elapsed() < ttl)
+            .find(|page| {
+                page.url == url
+                    && page.max_chars == max_chars
+                    && &page.language == language
+                    && self.cache_ttl.is_none_or(|ttl| page.saved.elapsed() < ttl)
             })
-            .map(|(_, _, _, content)| content.clone())
+            .map(|page| page.content.clone())
     }
 
-    fn remember(&self, url: &str, max_chars: usize, content: PageContent) {
+    fn remember(
+        &self,
+        url: &str,
+        max_chars: usize,
+        language: &AcceptLanguage,
+        content: PageContent,
+    ) {
         let mut pages = self
             .pages
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        pages.retain(|(known, limit, _, _)| known != url || *limit != max_chars);
-        pages.push_back((
-            url.to_string(),
+        pages.retain(|page| {
+            page.url != url || page.max_chars != max_chars || &page.language != language
+        });
+        pages.push_back(CachedPage {
+            url: url.to_string(),
             max_chars,
-            std::time::Instant::now(),
+            language: language.clone(),
+            saved: Instant::now(),
             content,
-        ));
+        });
         if pages.len() > REMEMBERED_PAGES {
             pages.pop_front();
         }
@@ -555,10 +595,18 @@ mod tests {
             source_truncated: false,
         };
         let session = PageReader::new(&crate::settings::Outgoing::default(), &[]).unwrap();
-        session.remember("https://example.org/", 100, content.clone());
-        assert!(session.remembered("https://example.org/", 100).is_some());
+        let language = AcceptLanguage::default();
+        session.remember("https://example.org/", 100, &language, content.clone());
+        assert!(
+            session
+                .remembered("https://example.org/", 100, &language)
+                .is_some()
+        );
         let http = session.with_cache_ttl(Duration::ZERO);
-        assert!(http.remembered("https://example.org/", 100).is_none());
+        assert!(
+            http.remembered("https://example.org/", 100, &language)
+                .is_none()
+        );
     }
 
     #[test]
@@ -681,6 +729,18 @@ mod tests {
             .unwrap();
         assert_eq!(&*page.text, "from an external source");
         assert!(!page.source_truncated);
+        let error = reader
+            .read_with_language(
+                "https://example.com/article",
+                100,
+                &AcceptLanguage::parse("ko-KR").unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("requires the direct page fetch provider"),
+            "{error}"
+        );
     }
 
     #[tokio::test]

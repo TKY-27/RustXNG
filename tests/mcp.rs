@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use axum::Router;
-use axum::http::header;
+use axum::http::{HeaderMap, header};
 use axum::response::Redirect;
 use axum::routing::get;
 use rmcp::model::{CallToolRequestParams, CallToolResult};
@@ -78,9 +78,15 @@ async fn connect_with_page(page: String) -> Fixture {
             )
             .route(
                 "/rust",
-                get(move || {
+                get(move |headers: HeaderMap| {
                     counter.fetch_add(1, Ordering::SeqCst);
-                    let page = page.clone();
+                    let page = match headers.get(header::ACCEPT_LANGUAGE) {
+                        Some(language) => format!(
+                            "<article>{} page text</article>",
+                            language.to_str().unwrap(),
+                        ),
+                        None => page.clone(),
+                    };
                     async move { ([(header::CONTENT_TYPE, "text/html")], page) }
                 }),
             )
@@ -290,6 +296,87 @@ async fn read_page_pages_through_a_returned_url_by_character() {
 }
 
 #[tokio::test]
+async fn read_page_keeps_language_variants_separate_while_paging() {
+    let Fixture {
+        client,
+        origin,
+        page_fetches,
+        ..
+    } = connect().await;
+    call(&client, "search", json!({"query": "rust", "limit": 1})).await;
+    let url = format!("{origin}/rust");
+    let preference = "KO-KR ; q=1.000, ko;q=0.900,en;q=0.8";
+    let first = call(
+        &client,
+        "read_page",
+        json!({
+            "url": url, "accept_language": preference, "max_chars": 8,
+        }),
+    )
+    .await;
+    let first = structured(&first);
+    let rest = call(
+        &client,
+        "read_page",
+        json!({
+            "url": url, "accept_language": "ko-kr,ko;q=0.9,en;q=0.8",
+            "offset": first["next_offset"],
+        }),
+    )
+    .await;
+    assert_eq!(
+        format!(
+            "{}{}",
+            first["text"].as_str().unwrap(),
+            structured(&rest)["text"].as_str().unwrap()
+        ),
+        "ko-kr,ko;q=0.9,en;q=0.8 page text",
+    );
+    assert_eq!(page_fetches.load(Ordering::SeqCst), 1);
+
+    let english = call(
+        &client,
+        "read_page",
+        json!({"url": url, "accept_language": "en-US"}),
+    )
+    .await;
+    assert_eq!(structured(&english)["text"], "en-us page text");
+    let default = call(&client, "read_page", json!({"url": url})).await;
+    assert_eq!(structured(&default)["text"], PAGE_TEXT);
+    let korean = call(
+        &client,
+        "read_page",
+        json!({"url": url, "accept_language": preference}),
+    )
+    .await;
+    assert_eq!(
+        structured(&korean)["text"],
+        "ko-kr,ko;q=0.9,en;q=0.8 page text"
+    );
+    assert_eq!(page_fetches.load(Ordering::SeqCst), 3);
+
+    for language in ["en\r\nX-Test: injected", "en;q=1.001"] {
+        let error = call(
+            &client,
+            "read_page",
+            json!({"url": url, "accept_language": language}),
+        )
+        .await;
+        assert!(error_text(&error).contains("accept_language"));
+    }
+    let unreturned = url.replacen("http:", "https:", 1);
+    let error = call(
+        &client,
+        "read_page",
+        json!({"url": unreturned, "accept_language": "ko-KR"}),
+    )
+    .await;
+    assert!(error_text(&error).contains("only reads URLs that search returned"));
+    assert_eq!(page_fetches.load(Ordering::SeqCst), 3);
+    client.cancel().await.unwrap();
+}
+
+#[tokio::test]
 async fn read_page_selects_cjk_passages_from_the_entire_page() {
     let Fixture { client, origin, .. } = connect_with_page(
         "<html><body><article>前置きです。猫は眠っています！内存安全吗？\
@@ -446,7 +533,12 @@ async fn read_page_only_reaches_public_addresses_and_bounds_downloads() {
         (format!("{origin}/to-loopback"), "could not be fetched"),
         (format!("{origin}/to-localhost"), "could not be fetched"),
     ] {
-        let result = call(&client, "read_page", json!({"url": url})).await;
+        let result = call(
+            &client,
+            "read_page",
+            json!({"url": url, "accept_language": "ko-KR"}),
+        )
+        .await;
         assert!(error_text(&result).contains(reason), "{url}");
     }
     assert_eq!(page_fetches.load(Ordering::SeqCst), 0);
