@@ -118,6 +118,9 @@ PDF・画像・スクリプトなどは索引クローラーの対象外です�
 
 ## 過去の評価
 
+今回のローカル検索・集約処理の変更前後比較は [評価手順と生データ](../bench/local-retrieval/README.md) を参照してください。
+開発用の人工データによる回帰評価で、Web検索全体やExaとの品質比較ではありません。
+
 [2026-11-04の構成比較](COMPARISON-2026-11-04.md)は、文書サイトから作った41,144ページの索引とWikipedia索引を使った記録です。
 古い小規模索引の測定は [`bench/eval-100-localmerge.json`](../bench/eval-100-localmerge.json)、
 127,200ページの測定は [`bench/eval-100-127k.json`](../bench/eval-100-127k.json) に残しています。
