@@ -18,6 +18,14 @@ def identity(engine: dict) -> dict:
     }
 
 
+def review_for(engine: dict, policy: dict) -> dict:
+    module = engine.get("engine", engine["name"])
+    provider = policy["providers"].get(module, {})
+    if provider.get("standard_allowed") is False:
+        return provider
+    return policy.get("entries", {}).get(engine["name"], provider)
+
+
 def spacing_for(outgoing: dict, host: str) -> int:
     matches = [
         (domain, millis)
@@ -35,7 +43,10 @@ def validate(settings: dict, policy: dict, pending: dict) -> list[str]:
             continue
         name = engine["name"]
         module = engine.get("engine", name)
-        review = policy["providers"].get(module, {})
+        review = review_for(engine, policy)
+        entry_review = policy.get("entries", {}).get(name)
+        if entry_review is not None and entry_review.get("module") != module:
+            errors.append(f"{name}: entry-specific review does not cover module {module}")
         allowed = review.get("standard_allowed")
         if allowed is False:
             errors.append(f"{name}: {module} must be disabled in Standard ({review.get('decision')})")
@@ -67,7 +78,7 @@ def main() -> None:
     errors = validate(settings, policy, pending)
     if errors:
         raise SystemExit("\n".join(errors))
-    print("Standard policy checks passed. Pending entries remain unreviewed; see docs/PROVIDERS.md.")
+    print("Standard policy checks passed. Pending entries remain unresolved; see docs/PROVIDERS.md.")
 
 
 if __name__ == "__main__":

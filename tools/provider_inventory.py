@@ -12,6 +12,8 @@ import re
 import tomllib
 from pathlib import Path
 
+from check_provider_policy import review_for
+
 ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -30,7 +32,7 @@ def inventory() -> str:
         production = text.split('#[cfg(test)]', 1)[0]
         disabled = engine.get('disabled', False)
         inactive = engine.get('inactive', False)
-        entry = policy['providers'].get(module, {})
+        entry = review_for(engine, policy)
         writer.writerow([engine['name'], module, str(disabled).lower(), str(inactive).lower(), str(not disabled and not inactive).lower(),
                          source.relative_to(ROOT).as_posix() if source.exists() else 'src/engines/mod.rs (locate registration)',
                          engine.get('base_url') or engine.get('search_url') or '',

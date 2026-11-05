@@ -5,7 +5,7 @@ import json
 import tomllib
 import unittest
 
-from check_provider_policy import ROOT, identity, spacing_for, validate
+from check_provider_policy import ROOT, identity, review_for, spacing_for, validate
 
 
 class ProviderPolicyTests(unittest.TestCase):
@@ -24,6 +24,25 @@ class ProviderPolicyTests(unittest.TestCase):
     def test_shared_module_does_not_approve_a_new_provider(self) -> None:
         self.settings["engines"].append({"name": "new wiki", "engine": "mediawiki"})
         self.assertIn("permission review", " ".join(validate(self.settings, self.policy, self.pending)))
+
+    def test_named_review_does_not_cover_other_entries_or_modules(self) -> None:
+        review = dict(self.policy["providers"]["mwmbl"], module="json_engine",
+                      base_url="", search_url="https://one.example/search")
+        self.policy["entries"] = {"one": review}
+        engine = {"name": "one", "engine": "json_engine", "search_url": "https://one.example/search"}
+        self.assertEqual(validate({"engines": [engine], "outgoing": self.settings["outgoing"]}, self.policy, {}), [])
+        other = dict(engine, name="two")
+        self.assertEqual(review_for(other, self.policy), {})
+        self.assertIn("permission review", " ".join(validate({"engines": [other]}, self.policy, {})))
+        changed = dict(engine, engine="xpath")
+        self.assertIn("does not cover module", " ".join(validate({"engines": [changed]}, self.policy, {})))
+        del review["module"]
+        self.assertIn("does not cover module", " ".join(validate({"engines": [engine]}, self.policy, {})))
+
+    def test_named_review_cannot_override_a_blocked_module(self) -> None:
+        self.policy["entries"] = {"new bing alias": {"standard_allowed": True, "module": "bing"}}
+        self.settings["engines"].append({"name": "new bing alias", "engine": "bing"})
+        self.assertIn("must be disabled", " ".join(validate(self.settings, self.policy, self.pending)))
 
     def test_pending_endpoint_cannot_change_without_review(self) -> None:
         name = next(iter(self.pending))
